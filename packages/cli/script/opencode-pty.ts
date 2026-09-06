@@ -12,7 +12,7 @@ export type OpencodePtyAsset = {
 type Target = {
   readonly platform: string
   readonly arch: string
-  readonly libc?: "glibc" | "musl"
+  readonly libc?: "glibc" | "musl" | "android"
 }
 
 const core = createRequire(path.resolve(import.meta.dirname, "../../core/package.json"))
@@ -21,6 +21,8 @@ const pty = createRequire(core.resolve("@opencode-ai/pty/package.json"))
 export async function resolveOpencodePty(target: Target): Promise<OpencodePtyAsset | undefined> {
   if (target.platform !== "darwin" && target.platform !== "linux") return undefined
   if (target.arch !== "arm64" && target.arch !== "x64") return undefined
+  // Android: no bionic pty binary is published; the runtime degrades gracefully.
+  if (target.libc === "android") return undefined
 
   const suffix = [target.platform, target.arch, target.platform === "linux" ? (target.libc ?? "glibc") : undefined]
     .filter(Boolean)

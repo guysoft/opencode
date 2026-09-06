@@ -33,10 +33,11 @@ const releaseAssets = new Map<string, Promise<Map<string, string>>>()
 const allTargets: {
   os: string
   arch: "arm64" | "x64"
-  abi?: "musl"
+  abi?: "musl" | "android"
   avx2?: false
 }[] = [
   { os: "linux", arch: "arm64" },
+  { os: "linux", arch: "arm64", abi: "android" },
   { os: "linux", arch: "x64" },
   { os: "linux", arch: "x64", avx2: false },
   { os: "linux", arch: "arm64", abi: "musl" },
@@ -107,14 +108,72 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
       )
     },
   }
+  // Android: no bionic binding exists; emit a stub so the app starts without
+  // file watching (the runtime also honors OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER).
   const parcelWatcherPackage = `@parcel/watcher-${item.os}-${item.arch}${item.os === "linux" ? `-${item.abi ?? "glibc"}` : ""}`
   const parcelWatcherPlugin: BunPlugin = {
     name: "parcel-watcher-binding",
     setup(build) {
       build.onLoad({ filter: /filesystem\/watcher-binding\.ts$/ }, () => ({
-        contents: `export default () => require(${JSON.stringify(parcelWatcherPackage)})`,
+        contents: item.abi === "android" ? "export default undefined" : `export default () => require(${JSON.stringify(parcelWatcherPackage)})`,
         loader: "js",
       }))
+    },
+  }
+  // Android: patch @opentui/core's asset resolution to accept platform "android"
+  // and resolve the native library via OPENTUI_LIB_PATH / OTUI_ASSET_ROOT.
+  const opentuiAndroidPlugin: BunPlugin = {
+    name: "opentui-android-assets",
+    setup(build) {
+      build.onLoad({ filter: /chunk-bun-.*\.js$|chunk-node-.*\.js$/ }, async (args) => {
+        if (item.abi !== "android") return undefined
+        let contents = await Bun.file(args.path).text()
+        // 1. Accept "android" platform + "android" libc in asset descriptor/target checks
+        contents = contents.replace(
+          /if \(!Object.hasOwn\(NATIVE_FILE_NAMES, target.platform\) \|\| target.arch !== "arm64" && target.arch !== "x64"\) \{/,
+          `if (!Object.hasOwn(NATIVE_FILE_NAMES, target.platform) || target.arch !== "arm64" && target.arch !== "x64") {
+    if (target.platform === "android" && target.arch === "arm64") {
+      return { key: \`@opentui/core-android-arm64/\${NATIVE_FILE_NAMES.linux}\`, packageName: "@opentui/core-android-arm64", fileName: NATIVE_FILE_NAMES.linux }
+    }`,
+        )
+        contents = contents.replace(
+          /if \(target\.libc !== undefined && target\.libc !== "glibc" && target\.libc !== "musl"\) \{/,
+          `if (target.libc !== undefined && target.libc !== "glibc" && target.libc !== "musl" && target.libc !== "android") {`,
+        )
+        contents = contents.replace(
+          /if \(target\.platform !== "linux" && target\.libc !== undefined\) \{/,
+          `if (target.platform !== "linux" && target.platform !== "android" && target.libc !== undefined) {`,
+        )
+        // 2. OPENTUI_LIBC env guard: allow "android"
+        contents = contents.replace(
+          /On Linux, OPENTUI_LIBC must be unset, empty, "glibc", or "musl", got/g,
+          `On Linux, OPENTUI_LIBC must be unset, empty, "glibc", "musl", or "android", got`,
+        )
+        contents = contents.replace(
+          /libc !== "glibc" && libc !== "musl"\) \{\n/g,
+          `libc !== "glibc" && libc !== "musl" && libc !== "android") {\n`,
+        )
+        // 3. resolveNativeLibraryPath: honor OPENTUI_LIB_PATH first, then android import
+        contents = contents.replace(
+          /async function resolveNativeLibraryPath\(\) \{\n  const asset = getNativeAssetDescriptor\(getCurrentNodeAssetTarget\(\)\);\n  const configuredPath = resolveAssetRootPath\(asset\.key\);\n  if \(configuredPath !== undefined\) \{\n    return configuredPath;\n  \}/,
+          `async function resolveNativeLibraryPath() {
+  {
+    const envPath = process.env.OPENTUI_LIB_PATH;
+    if (envPath && existsSync(envPath)) return envPath;
+  }
+  const asset = getNativeAssetDescriptor(getCurrentNodeAssetTarget());
+  const configuredPath = resolveAssetRootPath(asset.key);
+  if (configuredPath !== undefined) {
+    return configuredPath;
+  }
+  if (process.platform === "android" || (process.platform === "linux" && process.env.OPENTUI_LIBC === "android")) {
+    try {
+      return (await import("@opentui/core-android-arm64")).default;
+    } catch (e) {}
+  }`,
+        )
+        return { contents, loader: "js" }
+      })
     },
   }
   const target = targetName(item)
@@ -124,7 +183,7 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
   const result = await Bun.build({
     entrypoints: ["./src/index.ts"],
     tsconfig: "./tsconfig.json",
-    plugins: [appAssetsPlugin, solidPlugin, parcelWatcherPlugin, opencodePtyPlugin, simulationGraphPlugin],
+    plugins: [appAssetsPlugin, solidPlugin, parcelWatcherPlugin, opentuiAndroidPlugin, opencodePtyPlugin, simulationGraphPlugin],
     external: ["node-gyp"],
     format: "esm",
     minify: true,
@@ -154,8 +213,10 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
       OPENCODE_ARTIFACT: `'cli'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "undefined",
       // FFF_LIBC selects the fff native lib variant: "musl" or "gnu".
-      FFF_LIBC: item.os === "linux" ? `'${item.abi ?? "gnu"}'` : "undefined",
-      ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
+      // Android uses bionic; the gnu build is bundled but expected to fail to
+      // load, falling back to the JS implementation at runtime.
+      FFF_LIBC: item.os === "linux" ? `'${item.abi && item.abi !== "musl" && item.abi !== "android" ? item.abi : "gnu"}'` : "undefined",
+      ...(item.os === "linux" && item.abi !== "android" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
     },
   })
 
@@ -188,11 +249,13 @@ async function compileExecutable(item: (typeof allTargets)[number]) {
   if (!release) return
 
   const platform = item.os === "win32" ? "windows" : item.os
+  // Android bionic builds ship as bun-linux-<arch>-android (no api-level suffix)
+  const assetAbi = item.abi === "android" ? "android" : item.abi
   const name = [
     "bun",
     platform,
     item.arch === "arm64" ? "aarch64" : item.arch,
-    item.abi,
+    assetAbi,
     item.avx2 === false ? "baseline" : undefined,
   ]
     .filter(Boolean)
